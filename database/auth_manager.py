@@ -4,34 +4,34 @@ Handles user registration and login with bcrypt password hashing.
 All credentials stored in a shared database/auth.db file.
 """
 
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import os
 import re
 from datetime import datetime
+from dotenv import load_dotenv
 
-AUTH_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "database", "auth.db")
-
+load_dotenv()
 
 def _get_auth_conn():
-    os.makedirs(os.path.dirname(AUTH_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(AUTH_DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     return conn
 
 
 def init_auth_db():
     """Create the shared users table if it doesn't exist."""
     conn = _get_auth_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL COLLATE NOCASE,
-            password_hash TEXT NOT NULL,
-            display_name TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_login TEXT
-        )
-    """)
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        """)
     conn.commit()
     conn.close()
 
@@ -59,14 +59,15 @@ def register_user(username: str, password: str, display_name: str = "") -> tuple
 
     try:
         conn = _get_auth_conn()
-        conn.execute(
-            "INSERT INTO users (username, password_hash, display_name) VALUES (?, ?, ?)",
-            (username.lower(), pw_hash, display)
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, password_hash, display_name) VALUES (%s, %s, %s)",
+                (username.lower(), pw_hash, display)
+            )
         conn.commit()
         conn.close()
         return True, f"Account created! Welcome, {display} 🎉"
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False, f"Username '{username}' is already taken. Try another."
     except Exception as e:
         return False, f"Registration error: {e}"
@@ -85,31 +86,33 @@ def login_user(username: str, password: str) -> tuple[bool, dict]:
 
     try:
         conn = _get_auth_conn()
-        row = conn.execute(
-            "SELECT id, username, password_hash, display_name FROM users WHERE username=?",
-            (username,)
-        ).fetchone()
-
-        if not row:
-            conn.close()
-            return False, {"error": "Username not found."}
-
-        if bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8")):
-            # Update last_login
-            conn.execute(
-                "UPDATE users SET last_login=? WHERE username=?",
-                (datetime.now().isoformat(), username)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, username, password_hash, display_name FROM users WHERE username=%s",
+                (username,)
             )
-            conn.commit()
-            conn.close()
-            return True, {
-                "username": row["username"],
-                "display_name": row["display_name"] or row["username"],
-                "id": row["id"],
-            }
-        else:
-            conn.close()
-            return False, {"error": "Incorrect password."}
+            row = cur.fetchone()
+
+            if not row:
+                conn.close()
+                return False, {"error": "Username not found."}
+
+            if bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8")):
+                # Update last_login
+                cur.execute(
+                    "UPDATE users SET last_login=%s WHERE username=%s",
+                    (datetime.now(), username)
+                )
+                conn.commit()
+                conn.close()
+                return True, {
+                    "username": row["username"],
+                    "display_name": row["display_name"] or row["username"],
+                    "id": row["id"],
+                }
+            else:
+                conn.close()
+                return False, {"error": "Incorrect password."}
     except Exception as e:
         return False, {"error": f"Login error: {e}"}
 
@@ -118,7 +121,9 @@ def get_user_count() -> int:
     """Return total registered user count."""
     try:
         conn = _get_auth_conn()
-        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users")
+            count = cur.fetchone()[0]
         conn.close()
         return count
     except Exception:
@@ -136,10 +141,11 @@ def change_password(username: str, old_password: str, new_password: str) -> tupl
     pw_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     try:
         conn = _get_auth_conn()
-        conn.execute(
-            "UPDATE users SET password_hash=? WHERE username=?",
-            (pw_hash, username.lower())
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET password_hash=%s WHERE username=%s",
+                (pw_hash, username.lower())
+            )
         conn.commit()
         conn.close()
         return True, "Password updated successfully."
