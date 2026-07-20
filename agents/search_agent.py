@@ -25,9 +25,14 @@ HEADERS = {
 }
 
 ALL_SOURCES = [
-    "LinkedIn", "Remotive", "Arbeitnow", "Himalayas",
-    "WeWorkRemotely", "Internshala", "AngelList", "Instahyre",
-    "Freshersworld", "Shine",
+    # Global / Remote
+    "LinkedIn", "Remotive", "Arbeitnow", "Himalayas", "WeWorkRemotely",
+    # Free APIs (no key needed)
+    "Jobicy", "NaukriRSS",
+    # Free tier APIs (key required — set in .env)
+    "JSearch", "Adzuna",
+    # India-specific scrapers
+    "Internshala", "AngelList", "Instahyre", "Freshersworld", "Shine",
 ]
 
 
@@ -408,9 +413,186 @@ def _keyword_filter(jobs: list, keywords: list) -> list:
     ]
 
 
+# ─── Jobicy (100% Free Public API) ──────────────────────────────────────────
+
+def search_jobicy(keywords: list, limit: int = 30) -> list:
+    """Jobicy Remote Jobs API — completely free, no key needed."""
+    jobs = []
+    try:
+        tag = keywords[0].replace(" ", "+") if keywords else "developer"
+        resp = requests.get(
+            f"https://jobicy.com/api/v2/remote-jobs?count={limit}&tag={tag}",
+            headers=HEADERS, timeout=12
+        )
+        if resp.status_code == 200:
+            for item in resp.json().get("jobs", [])[:limit]:
+                jobs.append({
+                    "title": item.get("jobTitle", ""),
+                    "company": item.get("companyName", "Unknown"),
+                    "location": item.get("jobGeo", "Remote"),
+                    "job_type": item.get("jobType", "Full-time"),
+                    "salary": item.get("annualSalaryMin", ""),
+                    "description": item.get("jobDescription", "")[:2000],
+                    "url": item.get("url", ""),
+                    "source": "Jobicy",
+                    "discovered_at": datetime.now().isoformat(),
+                })
+    except Exception as e:
+        print(f"[Jobicy] {e}")
+    return jobs
+
+
+# ─── Naukri RSS Feed (100% Free) ─────────────────────────────────────────────
+
+def search_naukri_rss(keywords: list, locations: str = "India", limit: int = 30) -> list:
+    """
+    Naukri.com publishes undocumented but public RSS feeds.
+    URL pattern: https://www.naukri.com/rss/jobsearch/it-jobs?k=<keyword>&l=<location>
+    """
+    jobs = []
+    kw = keywords[0].replace(" ", "-").lower() if keywords else "software"
+    loc = locations.split(",")[0].strip().lower().replace(" ", "-")
+    try:
+        rss_url = f"https://www.naukri.com/jobapi/v3/search?noOfResults={limit}&urlType=search_by_keyword&searchType=adv&keyword={'+'.join(keywords[:2])}&location={loc}&pageNo=1&seoKey={kw}-jobs-in-{loc}&src=jobsearchDesk&latLong="
+        # Naukri also exposes a simplified RSS-like public feed:
+        feed_url = f"https://www.naukri.com/rss/jobsearch/it-jobs?k={keywords[0]}&l={loc}"
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries[:limit]:
+            title = entry.get("title", "")
+            link = entry.get("link", "")
+            summary = entry.get("summary", "")
+            # Naukri RSS title is usually: "Job Title - Company Name"
+            parts = title.split(" - ", 1)
+            job_title = parts[0].strip() if parts else title
+            company = parts[1].strip() if len(parts) > 1 else "Unknown"
+            jobs.append({
+                "title": job_title,
+                "company": company,
+                "location": loc.title(),
+                "job_type": "Full-time",
+                "salary": "",
+                "description": BeautifulSoup(summary, "html.parser").get_text()[:2000],
+                "url": link,
+                "source": "NaukriRSS",
+                "discovered_at": datetime.now().isoformat(),
+            })
+    except Exception as e:
+        print(f"[NaukriRSS] {e}")
+    return jobs
+
+
+# ─── JSearch via RapidAPI (Free 200 req/month) ────────────────────────────────
+
+def search_jsearch(keywords: list, locations: str = "India", remote: bool = False, limit: int = 30) -> list:
+    """
+    JSearch on RapidAPI — aggregates LinkedIn + Indeed + Glassdoor.
+    FREE tier: 200 requests/month. Set RAPIDAPI_KEY in .env to enable.
+    Sign up at: https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
+    """
+    import os
+    api_key = os.getenv("RAPIDAPI_KEY", "")
+    if not api_key:
+        print("[JSearch] No RAPIDAPI_KEY set. Skipping. Get a free key at rapidapi.com")
+        return []
+    jobs = []
+    query = " ".join(keywords[:2])
+    loc = locations.split(",")[0].strip()
+    try:
+        url = "https://jsearch.p.rapidapi.com/search"
+        params = {
+            "query": f"{query} jobs in {loc}",
+            "page": "1",
+            "num_pages": "2",
+            "date_posted": "week",
+        }
+        if remote:
+            params["remote_jobs_only"] = "true"
+        resp = requests.get(
+            url,
+            headers={
+                **HEADERS,
+                "X-RapidAPI-Key": api_key,
+                "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+            },
+            params=params,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for item in resp.json().get("data", [])[:limit]:
+                jobs.append({
+                    "title": item.get("job_title", ""),
+                    "company": item.get("employer_name", "Unknown"),
+                    "location": item.get("job_city", loc) + ", " + item.get("job_country", ""),
+                    "job_type": item.get("job_employment_type", "Full-time"),
+                    "salary": f"{item.get('job_min_salary','')} - {item.get('job_max_salary','')}".strip(" - "),
+                    "description": item.get("job_description", "")[:2000],
+                    "url": item.get("job_apply_link", item.get("job_google_link", "")),
+                    "source": f"JSearch ({item.get('job_publisher','')[:10]})",
+                    "discovered_at": datetime.now().isoformat(),
+                })
+        elif resp.status_code == 429:
+            print("[JSearch] Rate limit reached (200 req/month on free tier)")
+        else:
+            print(f"[JSearch] HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[JSearch] {e}")
+    return jobs
+
+
+# ─── Adzuna India (Free 1000 req/month) ──────────────────────────────────────
+
+def search_adzuna(keywords: list, locations: str = "India", limit: int = 30) -> list:
+    """
+    Adzuna Jobs API — has India-specific data.
+    FREE tier: 1000 requests/month. Set ADZUNA_APP_ID + ADZUNA_APP_KEY in .env.
+    Sign up at: https://developer.adzuna.com/
+    """
+    import os
+    app_id = os.getenv("ADZUNA_APP_ID", "")
+    app_key = os.getenv("ADZUNA_APP_KEY", "")
+    if not app_id or not app_key:
+        print("[Adzuna] No ADZUNA_APP_ID/KEY set. Skipping. Get free keys at developer.adzuna.com")
+        return []
+    jobs = []
+    query = " ".join(keywords[:3])
+    try:
+        resp = requests.get(
+            f"https://api.adzuna.com/v1/api/jobs/in/search/1",
+            params={
+                "app_id": app_id,
+                "app_key": app_key,
+                "results_per_page": min(limit, 50),
+                "what": query,
+                "content-type": "application/json",
+                "sort_by": "date",
+            },
+            headers=HEADERS,
+            timeout=12,
+        )
+        if resp.status_code == 200:
+            for item in resp.json().get("results", [])[:limit]:
+                jobs.append({
+                    "title": item.get("title", ""),
+                    "company": item.get("company", {}).get("display_name", "Unknown"),
+                    "location": item.get("location", {}).get("display_name", "India"),
+                    "job_type": item.get("contract_time", "full_time").replace("_", " ").title(),
+                    "salary": f"₹{item.get('salary_min',''):.0f} - ₹{item.get('salary_max',''):.0f}" if item.get('salary_min') else "",
+                    "description": item.get("description", "")[:2000],
+                    "url": item.get("redirect_url", ""),
+                    "source": "Adzuna",
+                    "discovered_at": datetime.now().isoformat(),
+                })
+        else:
+            print(f"[Adzuna] HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Adzuna] {e}")
+    return jobs
+
+
 # ─── Main Search Orchestrator ─────────────────────────────────────────────────
 
 SOURCE_FN_MAP = {
+    # ── Global / Remote ───────────────────────────────────────────────────────
     "LinkedIn":       lambda kw, prefs, is_remote, loc: search_linkedin(
         kw, locations=loc, remote=is_remote,
         experience_level=prefs.get("experience_level", "mid"), limit=30),
@@ -418,6 +600,13 @@ SOURCE_FN_MAP = {
     "Arbeitnow":      lambda kw, prefs, is_remote, loc: search_arbeitnow(kw, remote=is_remote, limit=30),
     "Himalayas":      lambda kw, prefs, is_remote, loc: search_himalayas(kw, limit=20),
     "WeWorkRemotely": lambda kw, prefs, is_remote, loc: search_weworkremotely(limit=20),
+    # ── Free APIs (zero key needed) ───────────────────────────────────────────
+    "Jobicy":         lambda kw, prefs, is_remote, loc: search_jobicy(kw, limit=30),
+    "NaukriRSS":      lambda kw, prefs, is_remote, loc: search_naukri_rss(kw, locations=loc, limit=30),
+    # ── Free-tier APIs (key required) ─────────────────────────────────────────
+    "JSearch":        lambda kw, prefs, is_remote, loc: search_jsearch(kw, locations=loc, remote=is_remote, limit=30),
+    "Adzuna":         lambda kw, prefs, is_remote, loc: search_adzuna(kw, locations=loc, limit=30),
+    # ── India-specific scrapers ───────────────────────────────────────────────
     "Internshala":    lambda kw, prefs, is_remote, loc: search_internshala(kw, limit=20),
     "AngelList":      lambda kw, prefs, is_remote, loc: search_angellist(kw, limit=20),
     "Instahyre":      lambda kw, prefs, is_remote, loc: search_instahyre(kw, limit=15),
