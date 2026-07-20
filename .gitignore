@@ -1,0 +1,9 @@
+venv/
+.env
+database/kelsai.db
+data/base_resume.pdf
+data/generated/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
