@@ -26,8 +26,10 @@ from database.db_manager import (
     update_job_status, get_all_jobs, get_job_stats, save_preferences,
     get_preferences, save_qa, get_all_qa,
     log_job_event, get_job_history, get_scheduler_settings, save_scheduler_settings,
-    save_cover_letter, get_cover_letters
+    save_cover_letter, get_cover_letters,
+    set_active_user, get_active_user, save_user_api_keys, get_user_api_keys
 )
+from database.auth_manager import init_auth_db, register_user, login_user, get_user_count
 from agents.profile_agent import process_resume
 from agents.search_agent import search_all_sources, ALL_SOURCES
 from agents.matcher_agent import match_jobs_batch
@@ -35,18 +37,8 @@ from agents.cover_letter_agent import generate_cover_letter, tailor_resume_summa
 from agents.skill_gap_agent import analyze_skill_gap
 from agents.scheduler import schedule_daily_hunt, schedule_digest_email
 
-init_db()
-
-# Start background scheduler if enabled
-_sched_settings = get_scheduler_settings()
-if _sched_settings.get("auto_hunt_enabled"):
-    schedule_daily_hunt(hour=_sched_settings.get("hunt_hour", 8))
-if _sched_settings.get("digest_enabled"):
-    schedule_digest_email(
-        hour=_sched_settings.get("digest_hour", 9),
-        email=_sched_settings.get("digest_email", ""),
-        smtp_settings=_sched_settings
-    )
+# Initialise shared auth DB
+init_auth_db()
 
 # ─── Google Fonts + CSS ───────────────────────────────────────────────────────
 st.markdown("""
@@ -344,29 +336,149 @@ div[data-baseweb="underline"][aria-selected="true"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Session State ─────────────────────────────────────────────────────────────
-for k, v in [("ai_client", None), ("embedding_model", None), ("ai_ready", False)]:
+# ─── Session State ─────────────────────────────────────────────────────────────────
+for k, v in [("ai_client", None), ("embedding_model", None), ("ai_ready", False),
+             ("user", None), ("auth_view", "login"), ("api_keys", {}),
+             ("auto_connect_done", False)]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+# ─── LOGIN GATE ─────────────────────────────────────────────────────────────────
+if st.session_state.user is None:
+    st.markdown("""
+    <div style="max-width:440px;margin:60px auto;text-align:center;">
+      <div style="font-size:3rem;margin-bottom:0.4rem;">🎯</div>
+      <h1 style="font-size:2.2rem;font-weight:900;background:linear-gradient(135deg,#6366f1,#a855f7);
+                 -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                 margin-bottom:0.3rem;">KelsAI</h1>
+      <p style="color:#64748b;margin-bottom:2rem;">Your AI Job Copilot</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        view = st.radio("", ["🔑 Sign In", "📝 Register"], horizontal=True,
+                        label_visibility="collapsed",
+                        index=0 if st.session_state.auth_view == "login" else 1)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if view == "🔑 Sign In":
+            with st.form("login_form"):
+                st.markdown("#### Sign In")
+                uname = st.text_input("Username", placeholder="your_username")
+                pwd = st.text_input("Password", type="password", placeholder="••••••")
+                submit = st.form_submit_button("Sign In", use_container_width=True, type="primary")
+                if submit:
+                    ok, result = login_user(uname, pwd)
+                    if ok:
+                        st.session_state.user = result
+                        # Switch DB to this user's file and init their tables
+                        set_active_user(result["username"])
+                        init_db()
+                        # Load their saved API keys into session state
+                        keys = get_user_api_keys()
+                        st.session_state.api_keys = keys
+                        st.session_state.auto_connect_done = False
+                        st.success(f"Welcome back, {result['display_name']}! 👋")
+                        st.rerun()
+                    else:
+                        st.error(result.get("error", "Login failed."))
+
+        else:  # Register
+            with st.form("register_form"):
+                st.markdown("#### Create Account")
+                disp = st.text_input("Display Name", placeholder="Shivasai Moghekar")
+                uname = st.text_input("Username", placeholder="shivasai (letters, numbers, _)")
+                pwd = st.text_input("Password", type="password", placeholder="Min 6 characters")
+                pwd2 = st.text_input("Confirm Password", type="password", placeholder="Repeat password")
+                submit = st.form_submit_button("Create Account", use_container_width=True, type="primary")
+                if submit:
+                    if pwd != pwd2:
+                        st.error("Passwords do not match.")
+                    else:
+                        ok, msg = register_user(uname, pwd, display_name=disp)
+                        if ok:
+                            st.success(msg + " Please sign in.")
+                            st.session_state.auth_view = "login"
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        st.markdown(f"<br><p style='text-align:center;color:#475569;font-size:0.8rem;'>{get_user_count()} members</p>", unsafe_allow_html=True)
+
+    st.stop()  # Block the rest of the app until logged in
+
+
+# ─── User is logged in ─ switch to their DB ───────────────────────────────────────────
+# Ensure the right DB is active (re-initialises after Streamlit reruns)
+if get_active_user() != st.session_state.user.get("username", ""):
+    set_active_user(st.session_state.user["username"])
+    st.session_state.api_keys = get_user_api_keys()
+
+# Auto-connect AI on login if Gemini key exists
+if not st.session_state.auto_connect_done and not st.session_state.ai_ready:
+    st.session_state.auto_connect_done = True
+    key_to_use = st.session_state.api_keys.get("gemini_key")
+    provider_to_use = "gemini"
+    
+    if not key_to_use and st.session_state.api_keys.get("openrouter_key"):
+        key_to_use = st.session_state.api_keys.get("openrouter_key")
+        provider_to_use = "openrouter"
+
+    if key_to_use:
+        try:
+            from agents.ai_client import get_ai_client
+            st.session_state.ai_client = get_ai_client(provider=provider_to_use, api_key=key_to_use)
+            if st.session_state.embedding_model is None:
+                from sentence_transformers import SentenceTransformer
+                st.session_state.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+            st.session_state.ai_ready = True
+        except Exception as e:
+            print(f"Auto-connect failed: {e}")
+    init_db()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("""
+    st.markdown(f"""
     <div class="kels-logo">
         <h1>🎯 KelsAI</h1>
         <p>Your AI Job Copilot</p>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Logged-in user info + logout ──────────────────────────────────────────
+    user_display = st.session_state.user.get("display_name", st.session_state.user.get("username", "User"))
+    st.markdown(f"""
+    <div style="background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.18);border-radius:10px;
+                padding:0.6rem 0.9rem;margin:0.5rem 0;display:flex;align-items:center;gap:0.5rem;">
+        <span style="font-size:1.2rem;">👤</span>
+        <div>
+            <div style="font-size:0.83rem;font-weight:700;color:#e2e8f0;">{user_display}</div>
+            <div style="font-size:0.7rem;color:rgba(148,163,184,0.6);">@{st.session_state.user.get('username','')}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    if st.button("🚪 Logout", use_container_width=True, key="logout_btn"):
+        st.session_state.user = None
+        st.session_state.ai_client = None
+        st.session_state.ai_ready = False
+        st.session_state.embedding_model = None
+        st.session_state.api_keys = {}
+        st.session_state.auto_connect_done = False
+        st.rerun()
+
     st.divider()
 
     page = st.radio(
         "Navigation",
         ["🏠  Dashboard", "📄  My Profile", "⚙️  Preferences",
          "🔍  Job Hunt", "📋  Applications", "📊  Analytics", 
-         "📝  Cover Letters", "🎯  Skill Gap", "💬  Q&A Prep", "⏰  Scheduler"],
+         "📝  Cover Letters", "🎯  Skill Gap", "💬  Q&A Prep", "⏰  Scheduler",
+         "🔑  API Keys"],
         label_visibility="collapsed"
     )
 
@@ -374,9 +486,10 @@ with st.sidebar:
     st.markdown('<p class="section-label">AI Connection</p>', unsafe_allow_html=True)
 
     provider = st.selectbox("Provider", ["Gemini", "OpenRouter"], label_visibility="collapsed")
+    default_key = st.session_state.api_keys.get("gemini_key", "") if provider == "Gemini" else st.session_state.api_keys.get("openrouter_key", "")
     api_key = st.text_input(
         "API Key",
-        value=os.getenv("GEMINI_API_KEY" if provider == "Gemini" else "OPENROUTER_API_KEY", ""),
+        value=default_key,
         type="password",
         placeholder="Enter your API key...",
         label_visibility="collapsed"
@@ -722,7 +835,7 @@ elif page == "🔍  Job Hunt":
                     log_lines.append(msg)
                     log_box.markdown("\n\n".join(log_lines[-10:]))
 
-                jobs = search_all_sources(prefs, log_fn=ui_log, enabled_sources=selected_sources)
+                jobs = search_all_sources(prefs, log_fn=ui_log, enabled_sources=selected_sources, api_keys=st.session_state.api_keys)
                 st.write(f"✅ **{len(jobs)}** unique listings collected")
 
                 new_count = sum(1 for job in jobs if save_job(job))
@@ -1073,3 +1186,102 @@ elif page == "⏰  Scheduler":
                 cancel_job("daily_digest")
                 
             st.success("Settings saved and scheduler updated!")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: API KEYS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "🔑  API Keys":
+    st.title("🔑 My API Keys")
+    st.markdown(
+        "Your API keys are **stored securely in your personal database** on this server. "
+        "They are never shared with other users."
+    )
+
+    saved = get_user_api_keys()
+
+    with st.form("api_keys_form"):
+        st.markdown("### 🤖 AI Provider Keys")
+        st.markdown(
+            "Provide a key for **one** of the AI providers below. Gemini is recommended as its free tier is generous."
+        )
+        
+        gemini_status = "✅ Set" if saved.get("gemini_key") else "⚪ Not set"
+        st.markdown(f"**Gemini API Key** ({gemini_status}) — [Get key →](https://aistudio.google.com/app/apikey)")
+        gemini_key = st.text_input(
+            "Gemini API Key",
+            value=saved.get("gemini_key", ""),
+            type="password",
+            placeholder="AIzaSy...",
+            label_visibility="collapsed"
+        )
+        
+        openrouter_status = "✅ Set" if saved.get("openrouter_key") else "⚪ Not set"
+        st.markdown(f"**OpenRouter API Key** ({openrouter_status}) — [Get key →](https://openrouter.ai/keys)")
+        openrouter_key = st.text_input(
+            "OpenRouter API Key",
+            value=saved.get("openrouter_key", ""),
+            type="password",
+            placeholder="sk-or-v1-...",
+            label_visibility="collapsed"
+        )
+
+        st.divider()
+        st.markdown("### 📡 External Job Sources")
+        
+        rapidapi_status = "✅ Set" if saved.get("rapidapi_key") else "⚪ Not set"
+        st.markdown(
+            f"**LinkedIn via JSearch (RapidAPI)** ({rapidapi_status})\n\n"
+            "LinkedIn's official API is invite-only. JSearch aggregates LinkedIn, Indeed, and Glassdoor jobs. "
+            "Free tier allows 200 requests/month. [Get key →](https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch)"
+        )
+        rapidapi_key = st.text_input(
+            "RapidAPI Key",
+            value=saved.get("rapidapi_key", ""),
+            type="password",
+            placeholder="Paste your RapidAPI key...",
+            label_visibility="collapsed"
+        )
+
+        adzuna_status = "✅ Set" if (saved.get("adzuna_app_id") and saved.get("adzuna_app_key")) else "⚪ Not set"
+        st.markdown(
+            f"**Adzuna** ({adzuna_status})\n\n"
+            "India-focused jobs with salary data. Free tier allows 1000 requests/month. [Get keys →](https://developer.adzuna.com/)"
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            adzuna_app_id = st.text_input(
+                "Adzuna App ID",
+                value=saved.get("adzuna_app_id", ""),
+                type="password",
+                placeholder="App ID..."
+            )
+        with col2:
+            adzuna_app_key = st.text_input(
+                "Adzuna App Key",
+                value=saved.get("adzuna_app_key", ""),
+                type="password",
+                placeholder="App Key..."
+            )
+
+        submitted = st.form_submit_button("💾 Save My Keys", type="primary", use_container_width=True)
+        if submitted:
+            save_user_api_keys(
+                gemini_key=gemini_key,
+                openrouter_key=openrouter_key,
+                rapidapi_key=rapidapi_key,
+                adzuna_app_id=adzuna_app_id,
+                adzuna_app_key=adzuna_app_key
+            )
+            # Update session state immediately
+            st.session_state.api_keys = get_user_api_keys()
+            st.success("✅ Keys saved! If you set an AI key, you can now connect via the sidebar.")
+            st.rerun()
+
+    with st.expander("ℹ️ How are my keys stored?"):
+        st.markdown("""
+        - Each user has a **completely separate database file** on the server.
+        - Your keys live in `database/users/kelsai_<yourusername>.db` — no other user can read it.
+        - Keys are stored as plain text in your personal SQLite file. For extra security on a production server, you can encrypt the DB file, but for a friends-circle this is sufficient.
+        - **Never share your Gemini key publicly** — it costs you money if abused.
+        """)

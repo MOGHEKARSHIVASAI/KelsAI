@@ -1,6 +1,7 @@
 """
 KelsAI Database Manager
 Handles SQLite database initialization and all CRUD operations.
+Supports per-user isolated databases via set_active_user().
 """
 
 import sqlite3
@@ -8,15 +9,33 @@ import os
 import json
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "database", "kelsai.db")
+# ── Per-user DB path management ───────────────────────────────────────────────
+_BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+_USERS_DB_DIR = os.path.join(_BASE_DIR, "database", "users")
+_active_user: str = "default"
+
+DB_PATH = os.path.join(_BASE_DIR, "database", "kelsai.db")  # legacy fallback
+
+
+def set_active_user(username: str):
+    """Switch all DB operations to this user's personal database file."""
+    global _active_user, DB_PATH
+    _active_user = username.lower().replace(" ", "_")
+    os.makedirs(_USERS_DB_DIR, exist_ok=True)
+    DB_PATH = os.path.join(_USERS_DB_DIR, f"kelsai_{_active_user}.db")
+
+
+def get_active_user() -> str:
+    return _active_user
 
 
 def get_connection():
-    """Returns a database connection with row factory."""
+    """Returns a database connection with row factory for the active user."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 
 def init_db():
@@ -418,3 +437,76 @@ def get_all_qa() -> list:
     rows = conn.execute("SELECT * FROM qa_store ORDER BY category, question").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ─── User API Keys (stored per-user in their own DB) ─────────────────────────
+
+def save_user_api_keys(gemini_key: str = "", openrouter_key: str = "",
+                       rapidapi_key: str = "",
+                       adzuna_app_id: str = "", adzuna_app_key: str = ""):
+    """Store the user's API keys in their personal per-user DB. Never touches os.environ."""
+    conn = get_connection()
+    # Ensure api_keys table exists (with openrouter_key column)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_api_keys (
+            id INTEGER PRIMARY KEY,
+            gemini_key TEXT DEFAULT '',
+            openrouter_key TEXT DEFAULT '',
+            rapidapi_key TEXT DEFAULT '',
+            adzuna_app_id TEXT DEFAULT '',
+            adzuna_app_key TEXT DEFAULT '',
+            updated_at TEXT
+        )
+    """)
+    # Add openrouter_key column if upgrading from older schema
+    try:
+        conn.execute("ALTER TABLE user_api_keys ADD COLUMN openrouter_key TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass
+    existing = conn.execute("SELECT id FROM user_api_keys WHERE id=1").fetchone()
+    if existing:
+        conn.execute("""
+            UPDATE user_api_keys
+            SET gemini_key=?, openrouter_key=?, rapidapi_key=?,
+                adzuna_app_id=?, adzuna_app_key=?, updated_at=?
+            WHERE id=1
+        """, (gemini_key, openrouter_key, rapidapi_key,
+               adzuna_app_id, adzuna_app_key, datetime.now().isoformat()))
+    else:
+        conn.execute("""
+            INSERT INTO user_api_keys
+            (id, gemini_key, openrouter_key, rapidapi_key, adzuna_app_id, adzuna_app_key, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
+        """, (gemini_key, openrouter_key, rapidapi_key,
+               adzuna_app_id, adzuna_app_key, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_user_api_keys() -> dict:
+    """Retrieve the user's stored API keys."""
+    try:
+        conn = get_connection()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_api_keys (
+                id INTEGER PRIMARY KEY,
+                gemini_key TEXT DEFAULT '',
+                openrouter_key TEXT DEFAULT '',
+                rapidapi_key TEXT DEFAULT '',
+                adzuna_app_id TEXT DEFAULT '',
+                adzuna_app_key TEXT DEFAULT '',
+                updated_at TEXT
+            )
+        """)
+        # Add openrouter_key column if upgrading from older schema
+        try:
+            conn.execute("ALTER TABLE user_api_keys ADD COLUMN openrouter_key TEXT DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass
+        row = conn.execute("SELECT * FROM user_api_keys WHERE id=1").fetchone()
+        conn.close()
+        return dict(row) if row else {}
+    except Exception:
+        return {}

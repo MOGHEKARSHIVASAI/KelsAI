@@ -483,16 +483,17 @@ def search_naukri_rss(keywords: list, locations: str = "India", limit: int = 30)
 
 # ─── JSearch via RapidAPI (Free 200 req/month) ────────────────────────────────
 
-def search_jsearch(keywords: list, locations: str = "India", remote: bool = False, limit: int = 30) -> list:
+def search_jsearch(keywords: list, locations: str = "India", remote: bool = False,
+                   limit: int = 30, api_key: str = None) -> list:
     """
     JSearch on RapidAPI — aggregates LinkedIn + Indeed + Glassdoor.
-    FREE tier: 200 requests/month. Set RAPIDAPI_KEY in .env to enable.
+    FREE tier: 200 requests/month. Pass api_key directly or set RAPIDAPI_KEY in .env.
     Sign up at: https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
     """
     import os
-    api_key = os.getenv("RAPIDAPI_KEY", "")
-    if not api_key:
-        print("[JSearch] No RAPIDAPI_KEY set. Skipping. Get a free key at rapidapi.com")
+    key = api_key or os.getenv("RAPIDAPI_KEY", "")
+    if not key:
+        print("[JSearch] No API key set. Skipping. Get a free key at rapidapi.com")
         return []
     jobs = []
     query = " ".join(keywords[:2])
@@ -511,7 +512,7 @@ def search_jsearch(keywords: list, locations: str = "India", remote: bool = Fals
             url,
             headers={
                 **HEADERS,
-                "X-RapidAPI-Key": api_key,
+                "X-RapidAPI-Key": key,
                 "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
             },
             params=params,
@@ -541,17 +542,18 @@ def search_jsearch(keywords: list, locations: str = "India", remote: bool = Fals
 
 # ─── Adzuna India (Free 1000 req/month) ──────────────────────────────────────
 
-def search_adzuna(keywords: list, locations: str = "India", limit: int = 30) -> list:
+def search_adzuna(keywords: list, locations: str = "India", limit: int = 30,
+                  app_id: str = None, app_key: str = None) -> list:
     """
-    Adzuna Jobs API — has India-specific data.
-    FREE tier: 1000 requests/month. Set ADZUNA_APP_ID + ADZUNA_APP_KEY in .env.
+    Adzuna Jobs API — has India-specific data with salary info.
+    FREE tier: 1000 requests/month. Pass keys directly or set ADZUNA_APP_ID + ADZUNA_APP_KEY in .env.
     Sign up at: https://developer.adzuna.com/
     """
     import os
-    app_id = os.getenv("ADZUNA_APP_ID", "")
-    app_key = os.getenv("ADZUNA_APP_KEY", "")
-    if not app_id or not app_key:
-        print("[Adzuna] No ADZUNA_APP_ID/KEY set. Skipping. Get free keys at developer.adzuna.com")
+    _app_id = app_id or os.getenv("ADZUNA_APP_ID", "")
+    _app_key = app_key or os.getenv("ADZUNA_APP_KEY", "")
+    if not _app_id or not _app_key:
+        print("[Adzuna] No keys set. Skipping. Get free keys at developer.adzuna.com")
         return []
     jobs = []
     query = " ".join(keywords[:3])
@@ -559,8 +561,8 @@ def search_adzuna(keywords: list, locations: str = "India", limit: int = 30) -> 
         resp = requests.get(
             f"https://api.adzuna.com/v1/api/jobs/in/search/1",
             params={
-                "app_id": app_id,
-                "app_key": app_key,
+                "app_id": _app_id,
+                "app_key": _app_key,
                 "results_per_page": min(limit, 50),
                 "what": query,
                 "content-type": "application/json",
@@ -576,7 +578,7 @@ def search_adzuna(keywords: list, locations: str = "India", limit: int = 30) -> 
                     "company": item.get("company", {}).get("display_name", "Unknown"),
                     "location": item.get("location", {}).get("display_name", "India"),
                     "job_type": item.get("contract_time", "full_time").replace("_", " ").title(),
-                    "salary": f"₹{item.get('salary_min',''):.0f} - ₹{item.get('salary_max',''):.0f}" if item.get('salary_min') else "",
+                    "salary": f"\u20b9{item.get('salary_min',''):.0f} - \u20b9{item.get('salary_max',''):.0f}" if item.get('salary_min') else "",
                     "description": item.get("description", "")[:2000],
                     "url": item.get("redirect_url", ""),
                     "source": "Adzuna",
@@ -593,25 +595,30 @@ def search_adzuna(keywords: list, locations: str = "India", limit: int = 30) -> 
 
 SOURCE_FN_MAP = {
     # ── Global / Remote ───────────────────────────────────────────────────────
-    "LinkedIn":       lambda kw, prefs, is_remote, loc: search_linkedin(
+    "LinkedIn":       lambda kw, prefs, is_remote, loc, keys: search_linkedin(
         kw, locations=loc, remote=is_remote,
         experience_level=prefs.get("experience_level", "mid"), limit=30),
-    "Remotive":       lambda kw, prefs, is_remote, loc: search_remotive(kw, limit=30),
-    "Arbeitnow":      lambda kw, prefs, is_remote, loc: search_arbeitnow(kw, remote=is_remote, limit=30),
-    "Himalayas":      lambda kw, prefs, is_remote, loc: search_himalayas(kw, limit=20),
-    "WeWorkRemotely": lambda kw, prefs, is_remote, loc: search_weworkremotely(limit=20),
+    "Remotive":       lambda kw, prefs, is_remote, loc, keys: search_remotive(kw, limit=30),
+    "Arbeitnow":      lambda kw, prefs, is_remote, loc, keys: search_arbeitnow(kw, remote=is_remote, limit=30),
+    "Himalayas":      lambda kw, prefs, is_remote, loc, keys: search_himalayas(kw, limit=20),
+    "WeWorkRemotely": lambda kw, prefs, is_remote, loc, keys: search_weworkremotely(limit=20),
     # ── Free APIs (zero key needed) ───────────────────────────────────────────
-    "Jobicy":         lambda kw, prefs, is_remote, loc: search_jobicy(kw, limit=30),
-    "NaukriRSS":      lambda kw, prefs, is_remote, loc: search_naukri_rss(kw, locations=loc, limit=30),
-    # ── Free-tier APIs (key required) ─────────────────────────────────────────
-    "JSearch":        lambda kw, prefs, is_remote, loc: search_jsearch(kw, locations=loc, remote=is_remote, limit=30),
-    "Adzuna":         lambda kw, prefs, is_remote, loc: search_adzuna(kw, locations=loc, limit=30),
+    "Jobicy":         lambda kw, prefs, is_remote, loc, keys: search_jobicy(kw, limit=30),
+    "NaukriRSS":      lambda kw, prefs, is_remote, loc, keys: search_naukri_rss(kw, locations=loc, limit=30),
+    # ── Free-tier APIs (per-user key via session state) ───────────────────────
+    "JSearch":        lambda kw, prefs, is_remote, loc, keys: search_jsearch(
+        kw, locations=loc, remote=is_remote, limit=30,
+        api_key=keys.get("rapidapi_key") if keys else None),
+    "Adzuna":         lambda kw, prefs, is_remote, loc, keys: search_adzuna(
+        kw, locations=loc, limit=30,
+        app_id=keys.get("adzuna_app_id") if keys else None,
+        app_key=keys.get("adzuna_app_key") if keys else None),
     # ── India-specific scrapers ───────────────────────────────────────────────
-    "Internshala":    lambda kw, prefs, is_remote, loc: search_internshala(kw, limit=20),
-    "AngelList":      lambda kw, prefs, is_remote, loc: search_angellist(kw, limit=20),
-    "Instahyre":      lambda kw, prefs, is_remote, loc: search_instahyre(kw, limit=15),
-    "Freshersworld":  lambda kw, prefs, is_remote, loc: search_freshersworld(kw, limit=15),
-    "Shine":          lambda kw, prefs, is_remote, loc: search_shine(kw, locations=loc, limit=15),
+    "Internshala":    lambda kw, prefs, is_remote, loc, keys: search_internshala(kw, limit=20),
+    "AngelList":      lambda kw, prefs, is_remote, loc, keys: search_angellist(kw, limit=20),
+    "Instahyre":      lambda kw, prefs, is_remote, loc, keys: search_instahyre(kw, limit=15),
+    "Freshersworld":  lambda kw, prefs, is_remote, loc, keys: search_freshersworld(kw, limit=15),
+    "Shine":          lambda kw, prefs, is_remote, loc, keys: search_shine(kw, locations=loc, limit=15),
 }
 
 
@@ -620,9 +627,11 @@ def search_all_sources(
     log_fn=None,
     enabled_sources: list = None,
     use_cache: bool = True,
+    api_keys: dict = None,
 ) -> list:
     """
     Parallel job search across all selected sources.
+    - api_keys: per-user key dict from st.session_state — never uses os.environ directly
     - Checks 24-hr cache first
     - Runs all sources concurrently via ThreadPoolExecutor
     - Fuzzy-deduplicates cross-source duplicates
@@ -655,11 +664,12 @@ def search_all_sources(
 
     all_jobs = []
     source_results = {}
+    keys = api_keys or {}
 
     # ── Parallel scraping ─────────────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=min(len(active), 6)) as executor:
         future_to_source = {
-            executor.submit(SOURCE_FN_MAP[src], keywords, preferences, is_remote, pref_locations): src
+            executor.submit(SOURCE_FN_MAP[src], keywords, preferences, is_remote, pref_locations, keys): src
             for src in active if src in SOURCE_FN_MAP
         }
         for future in as_completed(future_to_source):

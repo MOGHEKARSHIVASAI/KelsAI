@@ -1,6 +1,8 @@
 venv/
 .env
 database/kelsai.db
+database/users/
+database/auth.db
 data/base_resume.pdf
 data/generated/
 logs/
